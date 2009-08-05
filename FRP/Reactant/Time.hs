@@ -1,7 +1,7 @@
-{-# LANGUAGE RecordWildCards, NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards, NamedFieldPuns, TypeFamilies, GeneralizedNewtypeDeriving #-}
 module FRP.Reactant.Time(
   -- * Types
-  Time, ITime,
+  Time, ITime, RTime(..),
   module FRP.Reactant.Types,
   -- * Making time
   newTime, newTime', deriveTime,
@@ -18,6 +18,8 @@ import Control.Concurrent.MVar
 import Control.Concurrent.QSem
 import Control.Exception
 
+import Data.AddBounds
+import Data.AdditiveGroup
 import Data.AffineSpace
 import Data.Int(Int64)
 import FRP.Reactant.Types
@@ -32,17 +34,36 @@ io = IOU.unsafePerformIO
 
 
 -- | Nanoseconds since 1970
-type Time = Int64
+type Time = AddBounds Int64
 
+-- | Relative time - intervals.
+newtype RTime = RTime { unRTime :: Time }
+              deriving(AdditiveGroup)
+
+instance AdditiveGroup Int64 where { zeroV = 0; (^+^) = (+); negateV = negate }
+
+instance AdditiveGroup a => AdditiveGroup (AddBounds a) where
+  zeroV = NoBound zeroV
+  (NoBound a) ^+^ (NoBound b) = NoBound (a ^+^ b)
+  MaxBound ^+^ MinBound = error "NaN"
+  MinBound ^+^ MaxBound = error "NaN"
+  MinBound ^+^ _ = MinBound
+  _ ^+^ MinBound = MinBound
+  MaxBound ^+^ _ = MaxBound
+  _ ^+^ MaxBound = MaxBound
+  negateV (NoBound a) = NoBound (negateV a)
+  negateV MaxBound = MinBound
+  negateV MinBound = MaxBound
 
 lastTimeV :: MVar Int64
-lastTimeV = io $ newMVar 0
+{-# NOINLINE lastTimeV #-}
+lastTimeV = io $ newMVar minBound
 
 lockTime :: IO a -> IO a
 lockTime = withMVar lastTimeV . const
 
 -- | Returns the number of nanoseconds since 1970.
-getTime :: IO Time
+getTime :: IO Int64
 getTime = do
   TOD s ps <- getClockTime
   return $ fromInteger $ s * 1000000000 + div ps 1000
@@ -55,13 +76,15 @@ getTime = do
 withTime :: (Time -> IO a) -> IO a
 withTime act = modifyMVar lastTimeV $ \lastTime -> do
   newTime <- max (lastTime + 1) <$> getTime
-  ret <- act newTime
+  ret <- act (NoBound newTime)
   return (newTime,ret)
 
 -- | Runs an action at a point in time strictly later than the time passed.
 -- This function returns immediately, forking off a thread if it has to wait.
 laterThan :: Time -> Action -> IO ()
-laterThan time act = do
+laterThan MinBound _ = return ()
+laterThan MaxBound _ = error "Possibly mistaken use of laterThan?"
+laterThan (NoBound time) act = do
   now <- getTime
   if now > time
     then act
@@ -74,32 +97,35 @@ laterThan time act = do
 
 -- | Most functionality is exported through the instances
 data ITime = ITime { 
-  offset :: Time -- ^ If the time is based on the clock, and is as yet unknown, then this is an offset to add to the current time when it becomes known.
+  offset :: RTime -- ^ If the time is based on the clock, and is as yet unknown, then this is a nanosecond offset to add to the current time when it becomes known.
   ,completeV :: MVar Bool -- ^ True once the time is known
   ,timeV :: MVar Time    -- ^ Empty until the time is known
-  ,qsemsV :: MVar [QSem] } -- ^ A list of semaphores to signal when the time becomes complete, empty thereafter.
-
+  ,actionsV :: MVar [Action] } -- ^ A list of actions to run when the time becomes complete, empty thereafter.
 
 -- | Called to complete an ITime, if it isn't created complete. Uses the clock, adds the offset, signals QSems.
+-- (Actually, the offset is currently always zero when this function is called, but it's added anyway.)
 complete :: ITime -> IO ()
-complete itime@ITime{offset} = withTime $ \now -> complete' itime (now+offset)
+complete itime = withTime (complete' itime)
 
--- | Called to complete an ITime. Does not add the offset - careful!
+-- | Called to complete an ITime; signals QSems, adds the offset.
 complete' :: ITime -> Time -> IO ()
 complete' ITime{..} time = do
   modifyMVar_ completeV $ const $ do
-    putMVar timeV time
+    putMVar timeV (unRTime offset ^+^ time)
     return True
-  mapM_ signalQSem =<< takeMVar qsemsV
+  sequence_ =<< takeMVar actionsV
 
+-- | Sets up an action to be run once the ITime is complete, or immediately if it already is.
+addAct :: ITime -> Action -> IO ()
+addAct ITime{..} act =
+  block $ withMVar completeV $ \complete -> do
+    if complete
+      then act
+      else modifyMVar_ actionsV (return . (act :))
 
 -- | Sets up a semaphore to be signalled once the ITime is complete, or immediately if it already is.
 addSem :: ITime -> QSem -> IO ()
-addSem ITime{..} sem =
-  withMVar completeV $ \complete -> do
-    if complete
-      then signalQSem sem
-      else modifyMVar_ qsemsV (return . (sem :))
+addSem time sem = addAct time (signalQSem sem)
 
 -- | Creates a new ITime with an already-known value.
 newTime :: Time -> ITime
@@ -108,19 +134,17 @@ newTime time = io $ ITime undefined <$> newMVar True <*> newMVar time <*> newEmp
 -- | Creates a new ITime, whose value is the current time of day when the corresponding Action is executed.
 newTime' :: IO (ITime, Action)
 newTime' = do
-  itime <- ITime 0 <$> newMVar False <*> newEmptyMVar <*> newMVar []
+  itime <- ITime zeroV <$> newMVar False <*> newEmptyMVar <*> newMVar []
   return (itime, complete itime)
 
--- | Creates a new ITime with a specified offset from the old one.
--- Performance warning: Forks a thread.
-deriveTime :: ITime -> Int64 -> ITime
+-- | Creates a new ITime with a specified nanosecond offset from the old one.
+deriveTime :: ITime -> RTime -> ITime
 deriveTime time@ITime{offset = oldOffset} extraOffset = io $ do
-  sem <- newQSem 0
-  addSem time sem
-  let offset = oldOffset + extraOffset
+  let offset = oldOffset ^+^ extraOffset
   derived <- ITime offset <$> newMVar False <*> newEmptyMVar <*> newMVar []
-  -- FIXME: It should be possible to avoid this forkIO; store Actions instead of QSems in ITime.
-  forkIO $ waitQSem sem >> complete' derived (unITime time + offset)
+  -- complete' is called from inside (eventually) a call to withTime by complete,
+  -- so the global time generator is locked. This is important for correctness.
+  addAct time (complete' derived (unITime time))
   return derived
   
 
@@ -137,7 +161,8 @@ isComplete ITime{completeV} = readMVar completeV
 -- be larger than the first, then passes the complete ITime as the first parameter
 -- to the passed action. If this flips them around, then the return value is returned in a Right,
 -- otherwise in a Left. If they are both known to be complete, the Bool is True, otherwise False.
--- Furthermore, the function is called with time updates locked.
+-- In other words, if the Bool is False then the second time > the first time, otherwise they are
+-- both complete and can be compared by value.
 wait :: ITime -> ITime -> (ITime -> Bool -> ITime -> IO a) -> IO (Either a a)
 wait it1 it2 act = do
   -- Wait for at least one to be complete
@@ -149,18 +174,25 @@ wait it1 it2 act = do
   c1 <- isComplete it1
   c2 <- isComplete it2
   case (c1,c2) of
-    (True,True) -> Left <$> call it1 True it2
-    (True,False) -> do it1 `wait4` it2; Left <$> call it1 False it2
-    (False,True) -> do it2 `wait4` it1; Right <$> call it2 False it1
+    (True,True) -> Left <$> act it1 True it2
+    (True,False) -> do it1 `wait4` it2; Left <$> call it1 it2
+    (False,True) -> do it2 `wait4` it1; Right <$> call it2 it1
   where
     -- | a `wait4` b: wait for b to be knowably later than a, or complete
     a `wait4` b@ITime{offset} = do
-      let threshold = unITime a - offset
+      let threshold = unITime a ^-^ unRTime offset
       sem <- newQSem 0
-      laterThan (threshold - offset) (signalQSem sem)
-      addSem it2 sem
+      laterThan threshold (signalQSem sem)
+      addSem b sem
       waitQSem sem
-    call a both b = block $ lockTime $ act a both b
+    call a b = block $ lockTime $ do
+      -- We need to check one last time whether b is complete /now/ or not. a is complete.
+      bothComplete <- isComplete b
+      act a bothComplete b
+
+instance Bounded ITime where
+  minBound = newTime minBound
+  maxBound = newTime maxBound
 
 -- To compare for equality, it suffices that one ITime is defined and the other's
 -- clock is past the complete one's value.
@@ -184,16 +216,11 @@ instance Ord ITime where
       reverseOrdering EQ = EQ
       reverseOrdering GT = LT
 
--- FIXME: Orphaned instance. For adoption by Conal!
--- instance AdditiveGroup Int64 where
---   zeroV = 0
---   (^+^) = (+)
---   negateV = negate
 
--- instance AffineSpace ITime where
---   type Diff ITime = Int64
---   (.-.) = undefined -- FIXME: Not quite sure about this one yet.
---   itime .+^ diff =  -- Just use deriveTime for now.
+instance AffineSpace ITime where
+  type Diff ITime = RTime
+  (.-.) = error "Unfortunately, subtracting ITimes unavoidably breaks the timeliness guarantee. Use unITime explicitly instead."
+  (.+^) = deriveTime
 
 instance Show ITime where
   show time = "ITime " ++ show (unITime time)
