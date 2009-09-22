@@ -89,7 +89,7 @@ withTime act = modifyMVar lastTimeV $ \lastTime -> do
 -- | Runs an action at a point in time strictly later than the time passed.
 -- This function returns immediately, forking off a thread if it has to wait.
 laterThan :: Time -> Action -> IO ()
-laterThan MinBound _ = return ()
+laterThan MinBound act = act >> return ()
 laterThan MaxBound _ = error "Possibly mistaken use of laterThan?"
 laterThan (NoBound time) act = do
   now <- getTime
