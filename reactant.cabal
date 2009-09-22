@@ -1,0 +1,20 @@
+cabal-version:       >= 1.2
+name:                reactant
+version:             0.0
+synopsis:            Simple FRP implementation
+description:         A simple replacement for reactive, written for learning purposes.
+category:            Control
+license:             OtherLicense
+license-file:        LICENSE
+author:              Svein Ove Aas
+maintainer:          svein.ove@aas.no
+build-depends:       base
+stability:           experimental
+build-type:          Simple
+
+Library
+        hs-source-dirs:  src
+        build-depends:   base >= 4
+        Exposed-Modules:
+                FRP.Reactant.Internal.Future
+                

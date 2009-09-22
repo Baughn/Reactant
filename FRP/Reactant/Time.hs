@@ -19,6 +19,7 @@ import Control.Concurrent.QSem
 import Control.Exception
 
 import Data.AddBounds
+import Data.Monoid
 import Data.AdditiveGroup
 import Data.AffineSpace
 import Data.Int(Int64)
@@ -37,8 +38,14 @@ io = IOU.unsafePerformIO
 type Time = AddBounds Int64
 
 -- | Relative time - intervals.
+--
+-- Monoid: mempty is zero, mappend is the sum of two intervals.
 newtype RTime = RTime { unRTime :: Time }
               deriving(AdditiveGroup)
+
+instance Monoid RTime where
+  mempty = zeroV
+  mappend = (^+^)
 
 instance AdditiveGroup Int64 where { zeroV = 0; (^+^) = (+); negateV = negate }
 
@@ -95,7 +102,9 @@ laterThan (NoBound time) act = do
       now' <- getTime
       when (now' <= time) (putStrLn "Underslept!" >> sleepPast now' time)
 
--- | Most functionality is exported through the instances
+-- | Most functionality is exported through the instances.
+-- 
+-- Monoid: mempty is a time at negative infinity, mappend is the largest of two times.
 data ITime = ITime { 
   offset :: RTime -- ^ If the time is based on the clock, and is as yet unknown, then this is a nanosecond offset to add to the current time when it becomes known.
   ,completeV :: MVar Bool -- ^ True once the time is known
@@ -216,6 +225,9 @@ instance Ord ITime where
       reverseOrdering EQ = EQ
       reverseOrdering GT = LT
 
+instance Monoid ITime where
+  mempty = newTime MinBound
+  mappend a b = if a >= b then a else b
 
 instance AffineSpace ITime where
   type Diff ITime = RTime
